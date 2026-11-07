@@ -23,4 +23,4 @@ jobs:
 - GitHub ActionsのOIDCトークンで `registry.noodles.jp` に push する。秘密情報は要らない。
 - `noodles.yaml` の形と、コードが読む環境変数の宣言漏れを確かめる。
 
-`v1` のタグは、互換を壊さない変更のたびに付け直す。
+`v1` はブランチ。互換を壊さない変更は main に入れてから `v1` を進め、壊すときは `v2` を作る。
