@@ -17,7 +17,10 @@ jobs:
       contents: read
       id-token: write
     steps:
+      # pull_request の github.sha はマージ用の仮のコミットなので、PRの先頭のコミットを使う
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/checkout@v7
         with:
           repository: The-Noodles/workflows
@@ -45,6 +48,6 @@ jobs:
       - name: ビルドして push する
         env:
           APP_PATH: ${{ inputs.path }}
-          COMMIT: ${{ github.sha }}
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
           NOODLES_DOCKER_CONFIG: ${{ runner.temp }}/noodles-docker
         run: python3 .noodles-workflows/scripts/build.py
