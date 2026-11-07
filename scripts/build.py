@@ -21,9 +21,9 @@ REGISTRY = "registry.noodles.jp"
 RAILPACK_FRONTEND = "ghcr.io/railwayapp/railpack-frontend:v0.43.0"
 
 
-def run(*args: str, cwd: Path | None = None) -> None:
+def run(*args: str, env: dict[str, str] | None = None) -> None:
     print("+", " ".join(args), flush=True)
-    subprocess.run(args, check=True, cwd=cwd)
+    subprocess.run(args, check=True, env=None if env is None else {**os.environ, **env})
 
 
 def image_name(repo: str, path: str, service: str, commit: str) -> str:
@@ -66,7 +66,8 @@ def main() -> int:
     compose = yaml.safe_load((base / "compose.yaml").read_text()) or {}
     services = compose.get("services") or {}
     built = 0
-    docker_config = Path(os.environ["DOCKER_CONFIG"])
+    # buildx の builder は ~/.docker にあるので、DOCKER_CONFIG を変えるのは crane だけにする
+    docker_config = Path(os.environ["NOODLES_DOCKER_CONFIG"])
     with tempfile.TemporaryDirectory() as tmp:
         for name, svc in services.items():
             spec = (svc or {}).get("build")
@@ -88,7 +89,7 @@ def main() -> int:
                 t.extractall(layout, filter="data")
             ref = image_name(repo, str(os.environ.get("APP_PATH") or "."), name, commit)
             login(docker_config)
-            run("crane", "push", str(layout), ref)
+            run("crane", "push", str(layout), ref, env={"DOCKER_CONFIG": str(docker_config)})
             built += 1
     print(f"{built}個のイメージを push しました")
     return 0

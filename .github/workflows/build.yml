@@ -46,5 +46,5 @@ jobs:
         env:
           APP_PATH: ${{ inputs.path }}
           COMMIT: ${{ github.sha }}
-          DOCKER_CONFIG: ${{ runner.temp }}/noodles-docker
+          NOODLES_DOCKER_CONFIG: ${{ runner.temp }}/noodles-docker
         run: python3 .noodles-workflows/scripts/build.py
