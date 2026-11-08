@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-TOP = {"project", "name", "domain", "branches", "preview", "services", "env", "volumes"}
+TOP = {"project", "name", "domain", "branches", "preview", "services", "env", "volumes", "bucket"}
 PROJECT = re.compile(r"^[a-z][a-z0-9-]{0,19}$")
 # 実行環境が入れる、宣言しなくてよい変数
 BUILTIN = {
