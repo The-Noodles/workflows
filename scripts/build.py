@@ -127,18 +127,6 @@ def not_from_source(path: str, excluded: set[str]) -> bool:
     return parts[0] in excluded
 
 
-def list_files(layout: Path) -> dict:
-    import tarfile
-    blob = lambda d: layout / "blobs" / d.replace(":", "/")
-    manifest = json.loads(blob(json.loads((layout / "index.json").read_text())["manifests"][0]["digest"]).read_text())
-    files: dict = {}
-    for layer in manifest["layers"]:
-        with tarfile.open(blob(layer["digest"])) as t:
-            for m in t:
-                files[m.name.rstrip("/")] = (m.type, oct(m.mode), m.uid, m.gid, m.size if m.isfile() else 0, m.linkname)
-    return files
-
-
 def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str], layout: Path, scope: str, log: IO[str] | None) -> list[str] | None:
     """ビルドして layout に書き出す。キャッシュが使えるときは、キャッシュへ書き出すためのコマンドを返す。"""
     common = ["docker", "buildx", "build", "--provenance=false", "--sbom=false"]
@@ -172,14 +160,6 @@ def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str
         shutil.rmtree(layout, ignore_errors=True)
         common = fallback
         run_build(*common, *output, *read_cache, log=log)
-    if fallback is not None and common is not fallback and os.environ.get("GITHUB_REPOSITORY") == "The-Noodles/workflows":
-        other = layout.parent / f"{name}-orig"
-        run_build(*fallback, "--output", f"type=oci,tar=false,dest={other}", log=log)
-        a, b = list_files(layout), list_files(other)
-        diff = sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
-        print(f"DEBUG 計画の比較：{len(a)} / {len(b)} ファイル、違い {len(diff)} 件", file=log)
-        for k in diff[:40]:
-            print("  ", k, a.get(k), b.get(k), file=log)
     if not cached:
         return None
     return [*common, "--output", "type=cacheonly", "--cache-to", f"type=gha,scope={scope},mode=max,ignore-error=true"]
