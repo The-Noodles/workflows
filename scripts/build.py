@@ -30,6 +30,35 @@ def run(*args: str, log: IO[str] | None, env: dict[str, str] | None = None) -> N
     subprocess.run(args, check=True, env=None if env is None else {**os.environ, **env}, stdout=log, stderr=subprocess.STDOUT if log else None)
 
 
+STEP = re.compile(r"^#(\d+) (.*)$")
+
+
+def run_build(*args: str, log: IO[str] | None) -> None:
+    """buildx を流し、最後に、手順ごとにキャッシュから出たか・何秒かかったかをまとめて出す。"""
+    out = log or sys.stdout
+    print("+", " ".join(args), file=out, flush=True)
+    names: dict[str, str] = {}
+    results: dict[str, str] = {}
+    with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace") as proc:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            out.write(line)
+            m = STEP.match(line.rstrip())
+            if not m:
+                continue
+            step, rest = m.groups()
+            if rest == "CACHED" or re.fullmatch(r"DONE [0-9.]+s", rest):
+                results[step] = "キャッシュ" if rest == "CACHED" else rest.removeprefix("DONE ")
+            else:
+                names.setdefault(step, rest)
+    print("手順ごとの時間：", file=out)
+    for step, result in results.items():
+        print(f"  {result:>8}  {names.get(step, step)}", file=out)
+    out.flush()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, args)
+
+
 def image_segment(path: str, service: str) -> str:
     if path in ("", "."):
         return service
@@ -68,9 +97,9 @@ def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str
     output = ["--output", f"type=oci,tar=false,dest={layout}"]
     # キャッシュの読み書きには、build.yml が環境変数に出す Actions のトークンが要る
     if not os.environ.get("ACTIONS_RUNTIME_TOKEN"):
-        run(*common, *output, log=log)
+        run_build(*common, *output, log=log)
         return None
-    run(*common, *output, "--cache-from", f"type=gha,scope={scope}", log=log)
+    run_build(*common, *output, "--cache-from", f"type=gha,scope={scope}", log=log)
     return [*common, "--output", "type=cacheonly", "--cache-to", f"type=gha,scope={scope},mode=max,ignore-error=true"]
 
 
