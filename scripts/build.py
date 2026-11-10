@@ -125,12 +125,9 @@ def build_and_push(name: str, spec: dict, base: Path, tmp: Path, log: IO[str] | 
     finally:
         if saving is not None:
             code = saving.wait()
-            cache_log.seek(0)
-            print("::group::キャッシュへの書き出し" if log is None else "キャッシュへの書き出し：", file=log, flush=True)
-            print(cache_log.read(), file=log, flush=True)
-            if log is None:
-                print("::endgroup::", flush=True)
             if code != 0:
+                cache_log.seek(0)
+                print(cache_log.read(), file=log, flush=True)
                 print("::warning::ビルドのキャッシュを書き出せませんでした（次のビルドが遅くなるだけで、今回のイメージには影響しません）", file=log, flush=True)
         cache_log.close()
 
