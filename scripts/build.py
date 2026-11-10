@@ -93,14 +93,25 @@ LARGE_BLOB = 90 * 1024 * 1024
 BLOB_CHUNK = 64 * 1024 * 1024
 
 
+# Cloudflare は Python-urllib の User-Agent を断るので、crane と同じものを名乗る
+USER_AGENT = "go-containerregistry/v0.22.1"
+
+
 def registry_request(method: str, url: str, token: str, data: bytes | None = None, headers: dict[str, str] | None = None):
-    req = urllib.request.Request(url, data=data, method=method, headers={"Authorization": "Bearer " + token, **(headers or {})})
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"Authorization": "Bearer " + token, "User-Agent": USER_AGENT, **(headers or {})},
+    )
     try:
         return urllib.request.urlopen(req, timeout=300)
     except urllib.error.HTTPError as e:
         if method == "HEAD" and e.code == 404:
             return None
-        raise RuntimeError(f"{method} {url.split('?')[0]}: {e.code} {e.read()[:300]!r}") from e
+        server = e.headers.get("server", "")
+        ray = e.headers.get("cf-ray", "")
+        raise RuntimeError(f"{method} {url.split('?')[0]}: {e.code} server={server} cf-ray={ray} {e.read()[:300]!r}") from e
 
 
 def upload_large_blobs(layout: Path, ref: str, token: str, log: IO[str] | None) -> None:
