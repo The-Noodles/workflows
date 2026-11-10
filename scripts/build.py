@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -71,8 +73,8 @@ def image_name(repo: str, path: str, service: str, commit: str) -> str:
     return f"{REGISTRY}/{repo.lower()}/{image_segment(path, service)}:{commit}"
 
 
-def login(config_dir: Path) -> None:
-    """GitHub ActionsのOIDCトークンを取り、crane が使う Docker の設定に置く。トークンは数分で切れるので push の直前に呼ぶ。"""
+def login(config_dir: Path) -> str:
+    """GitHub ActionsのOIDCトークンを取り、crane が使う Docker の設定に置いて返す。トークンは数分で切れるので push の直前に呼ぶ。"""
     url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=" + REGISTRY
     req = urllib.request.Request(url, headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
     with urllib.request.urlopen(req, timeout=30) as res:
@@ -82,6 +84,51 @@ def login(config_dir: Path) -> None:
     path = config_dir / "config.json"
     path.write_text(json.dumps({"auths": {REGISTRY: {"registrytoken": token}}}))
     path.chmod(0o600)
+    return token
+
+
+# レジストリの前の Cloudflare は 100MB を超える要求を断る（413）。crane は層を1回の要求で送るので、
+# 大きい層だけ先に分けて送っておく（crane はレジストリにある層を飛ばす）
+LARGE_BLOB = 90 * 1024 * 1024
+BLOB_CHUNK = 64 * 1024 * 1024
+
+
+def registry_request(method: str, url: str, token: str, data: bytes | None = None, headers: dict[str, str] | None = None):
+    req = urllib.request.Request(url, data=data, method=method, headers={"Authorization": "Bearer " + token, **(headers or {})})
+    try:
+        return urllib.request.urlopen(req, timeout=300)
+    except urllib.error.HTTPError as e:
+        if method == "HEAD" and e.code == 404:
+            return None
+        raise RuntimeError(f"{method} {url.split('?')[0]}: {e.code} {e.read()[:300]!r}") from e
+
+
+def upload_large_blobs(layout: Path, ref: str, token: str, log: IO[str] | None) -> None:
+    repo = ref.removeprefix(REGISTRY + "/").rsplit(":", 1)[0]
+    base = f"https://{REGISTRY}/v2/{repo}/blobs/"
+    for path in sorted((layout / "blobs" / "sha256").iterdir()):
+        size = path.stat().st_size
+        if size <= LARGE_BLOB:
+            continue
+        digest = "sha256:" + path.name
+        if registry_request("HEAD", base + digest, token) is not None:
+            continue
+        print(f"大きい層を分けて送ります：{digest}（{size // (1024 * 1024)}MB）", file=log, flush=True)
+        location = registry_request("POST", base + "uploads/", token, data=b"").headers["Location"]
+        offset = 0
+        with path.open("rb") as f:
+            while chunk := f.read(BLOB_CHUNK):
+                res = registry_request(
+                    "PATCH",
+                    urllib.parse.urljoin(base, location),
+                    token,
+                    data=chunk,
+                    headers={"Content-Type": "application/octet-stream", "Content-Range": f"{offset}-{offset + len(chunk) - 1}"},
+                )
+                location = res.headers["Location"]
+                offset += len(chunk)
+        url = urllib.parse.urljoin(base, location)
+        registry_request("PUT", url + ("&" if "?" in url else "?") + "digest=" + urllib.parse.quote(digest), token, data=b"")
 
 
 def shortcut_plan(plan: dict) -> dict | None:
@@ -182,7 +229,7 @@ def build_and_push(name: str, spec: dict, base: Path, tmp: Path, log: IO[str] | 
     # buildx の builder は ~/.docker にあるので、DOCKER_CONFIG を変えるのは crane だけにする
     docker_config = Path(os.environ["NOODLES_DOCKER_CONFIG"]) / name
     try:
-        login(docker_config)
+        upload_large_blobs(layout, ref, login(docker_config), log)
         run("crane", "push", str(layout), ref, log=log, env={"DOCKER_CONFIG": str(docker_config)})
     finally:
         if saving is not None:
