@@ -2,7 +2,7 @@
 
 詳しい確かめは Hub がデプロイのときに行う。ここでは、push の時点で分かる間違いを早めに知らせる。
 調べるのは compose.yaml の build: の置き場所の中だけ。別の Dockerfile がある下のディレクトリ（別のイメージ）、
-テストと設定のファイルは飛ばす。Dockerfile の ENV と compose.yaml の environment は宣言済みとみなす。
+テスト（E2E を含む）と設定のファイルは飛ばす。Dockerfile の ENV と compose.yaml の environment は宣言済みとみなす。
 宣言しなくてよい行には、同じ行に noodles-ignore-env と書く。
 """
 
@@ -18,12 +18,15 @@ PROJECT = re.compile(r"^[a-z][a-z0-9-]{0,19}$")
 # 実行環境が入れる、宣言しなくてよい変数
 BUILTIN = {
     "PORT", "NODE_ENV", "HOSTNAME", "HOST", "PATH", "HOME", "PWD", "TZ", "LANG", "CI", "DEBUG",
-    "NODE_OPTIONS", "VERCEL", "npm_package_version", "npm_lifecycle_event",
+    "NODE_OPTIONS", "VERCEL", "npm_package_version", "npm_lifecycle_event", "VITEST",
 }
+# Vite が import.meta.env に入れる値
+VITE_BUILTIN = {"DEV", "PROD", "MODE", "SSR", "BASE_URL"}
+VITE_ENV = re.compile(r"import\.meta\.env\.([A-Za-z_][A-Za-z0-9_]*)")
 PATTERNS = [
     re.compile(r"process\.env\.([A-Za-z_][A-Za-z0-9_]*)"),
     re.compile(r"process\.env\[['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\]"),
-    re.compile(r"import\.meta\.env\.([A-Za-z_][A-Za-z0-9_]*)"),
+    VITE_ENV,
     re.compile(r"Deno\.env\.get\(['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\)"),
     re.compile(r"Bun\.env\.([A-Za-z_][A-Za-z0-9_]*)"),
     re.compile(r"os\.environ(?:\.get)?[\[(]['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]"),
@@ -34,7 +37,7 @@ PATTERNS = [
 ]
 SUFFIXES = {".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".jsx", ".tsx", ".py", ".go", ".rb", ".rs", ".luau", ".lua"}
 TEST_FILE = re.compile(r"(\.(test|spec)\.[a-z]+$)|(^testing\.[a-z]+$)|(\.config\.[a-z]+$)|(_test\.go$)|(^test_.*\.py$)")
-SKIP_DIRS = {"test", "tests", "__tests__", "testdata", "node_modules", ".git", "dist", "build", ".next", "vendor", "target", ".venv", "__pycache__", ".noodles-workflows"}
+SKIP_DIRS = {"test", "tests", "__tests__", "testdata", "e2e", "node_modules", ".git", "dist", "build", ".next", "vendor", "target", ".venv", "__pycache__", ".noodles-workflows"}
 
 
 def error(msg: str, file: str | None = None, line: int | None = None) -> None:
@@ -110,6 +113,8 @@ def main(base: Path) -> int:
             for pat in PATTERNS:
                 for m in pat.finditer(line):
                     key = m.group(1)
+                    if pat is VITE_ENV and key in VITE_BUILTIN:
+                        continue
                     if key not in declared and key not in missing:
                         missing[key] = (os.path.relpath(f), i)
     for key, (file, line) in sorted(missing.items()):
