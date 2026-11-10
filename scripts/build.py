@@ -7,12 +7,16 @@
 レジストリにすでにあるものとして push も飛ばされる。キャッシュへの書き出しは push と並べて流す。サービスが複数あるときは並べてビルドする。
 """
 
+import contextlib
+import gzip
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -83,6 +87,125 @@ def login(config_dir: Path) -> None:
     path.write_text(json.dumps({"auths": {REGISTRY: {"registrytoken": token}}}))
     path.chmod(0o600)
 
+
+
+# レジストリの前の Cloudflare は 100MB を超える要求を断る（413）。crane は層を1回の要求で送るので、
+# 大きい層は push の前に、中のファイルを順に分けて複数の層にする（重ねた結果は同じ）
+LARGE_LAYER = 90 * 1024 * 1024
+PART_SIZE = 64 * 1024 * 1024
+
+
+def write_blob(layout: Path, data: bytes) -> dict:
+    digest = hashlib.sha256(data).hexdigest()
+    (layout / "blobs" / "sha256" / digest).write_bytes(data)
+    return {"digest": "sha256:" + digest, "size": len(data)}
+
+
+def split_layer(layout: Path, blob: Path, work: Path) -> list[tuple[dict, str]]:
+    """tar の並びを保ったまま PART_SIZE ごとの tar に分け、gzip した層の (記述子, diff_id) を返す。
+    ハードリンクは同じ層の中のファイルにしか張れないので、元と別の層に入ったリンクは中身を写したファイルにする。"""
+    assign: dict[str, int] = {}
+    crossing: set[str] = set()
+    part, used = 0, 0
+    with tarfile.open(blob, "r|*") as src:
+        for member in src:
+            if used > 0 and used + member.size + 512 > PART_SIZE:
+                part, used = part + 1, 0
+            assign[member.name] = part
+            used += member.size + 512
+            if member.islnk() and assign.get(member.linkname, part) != part:
+                crossing.add(member.linkname)
+
+    parts = [work / f"{blob.name}.{i}.tar" for i in range(part + 1)]
+    saved: dict[str, tuple[tarfile.TarInfo, Path]] = {}
+    outs: dict[int, tarfile.TarFile] = {}
+    with contextlib.ExitStack() as stack, tarfile.open(blob, "r|*") as src:
+        for member in src:
+            current = assign[member.name]
+            if current not in outs:
+                outs[current] = stack.enter_context(tarfile.open(parts[current], "w", format=tarfile.PAX_FORMAT))
+            out = outs[current]
+            if member.isreg() and member.name in crossing:
+                copy = work / f"link{len(saved)}"
+                with src.extractfile(member) as data, copy.open("wb") as f:  # type: ignore[union-attr]
+                    shutil.copyfileobj(data, f)
+                saved[member.name] = (member, copy)
+                with copy.open("rb") as f:
+                    out.addfile(member, f)
+                continue
+            if member.islnk() and member.linkname in saved and assign[member.linkname] != current:
+                target, copy = saved[member.linkname]
+                info = tarfile.TarInfo(member.name)
+                for key in ("mode", "uid", "gid", "uname", "gname", "mtime", "size", "pax_headers"):
+                    setattr(info, key, getattr(target, key))
+                with copy.open("rb") as f:
+                    out.addfile(info, f)
+                continue
+            out.addfile(member, src.extractfile(member) if member.isreg() else None)
+
+    def compress(part: Path) -> tuple[dict, str]:
+        raw = part.read_bytes()
+        part.unlink()
+        diff_id = "sha256:" + hashlib.sha256(raw).hexdigest()
+        desc = write_blob(layout, gzip.compress(raw, compresslevel=6, mtime=0))
+        return {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", **desc}, diff_id
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 2) as pool:
+        return list(pool.map(compress, parts))
+
+
+def split_manifest(layout: Path, entry: dict, log: IO[str] | None) -> None:
+    """entry が指すマニフェスト（入れ子の index も含む）の大きい層を分け、entry を新しいマニフェストに向ける。"""
+    blobs = layout / "blobs" / "sha256"
+    blob = blobs / entry["digest"].split(":", 1)[1]
+    if not blob.exists():
+        return
+    manifest = json.loads(blob.read_bytes())
+    if "manifests" in manifest:
+        before = json.dumps(manifest["manifests"])
+        for child in manifest["manifests"]:
+            split_manifest(layout, child, log)
+        if json.dumps(manifest["manifests"]) != before:
+            entry.update(write_blob(layout, json.dumps(manifest, separators=(",", ":")).encode()))
+        return
+    if not any(layer["size"] > LARGE_LAYER for layer in manifest.get("layers") or []):
+        return
+    config = json.loads((blobs / manifest["config"]["digest"].split(":", 1)[1]).read_bytes())
+    diff_ids = config["rootfs"]["diff_ids"]
+    history = config.get("history") or []
+    layered = [i for i, h in enumerate(history) if not h.get("empty_layer")]
+    if len(layered) != len(manifest["layers"]):
+        layered = []
+    layers: list[dict] = []
+    new_diff_ids: list[str] = []
+    new_history: list = list(history)
+    with tempfile.TemporaryDirectory(dir=layout) as work:
+        for i, layer in enumerate(manifest["layers"]):
+            if layer["size"] <= LARGE_LAYER or not layer["mediaType"].endswith(("tar", "tar+gzip", "tar.gzip")):
+                layers.append(layer)
+                new_diff_ids.append(diff_ids[i])
+                continue
+            parts = split_layer(layout, blobs / layer["digest"].split(":", 1)[1], Path(work))
+            sizes = "、".join(f"{d['size'] // (1024 * 1024)}MB" for d, _ in parts)
+            print(f"{layer['size'] // (1024 * 1024)}MB の層を {len(parts)} 個に分けました（{sizes}）", file=log, flush=True)
+            layers += [d for d, _ in parts]
+            new_diff_ids += [d for _, d in parts]
+            if layered:
+                new_history[layered[i]] = [history[layered[i]]] * len(parts)
+    config["rootfs"]["diff_ids"] = new_diff_ids
+    if layered:
+        config["history"] = [x for h in new_history for x in (h if isinstance(h, list) else [h])]
+    manifest["config"] = {**manifest["config"], **write_blob(layout, json.dumps(config, separators=(",", ":")).encode())}
+    manifest["layers"] = layers
+    entry.update(write_blob(layout, json.dumps(manifest, separators=(",", ":")).encode()))
+
+
+def split_large_layers(layout: Path, log: IO[str] | None) -> None:
+    index_path = layout / "index.json"
+    index = json.loads(index_path.read_text())
+    for entry in index["manifests"]:
+        split_manifest(layout, entry, log)
+    index_path.write_text(json.dumps(index, separators=(",", ":")))
 
 def shortcut_plan(plan: dict) -> dict | None:
     """コマンドのない手順（前の手順の上にソースを置くだけ）を飛ばした Railpack の計画を返す。飛ばせなければ None。
@@ -182,6 +305,7 @@ def build_and_push(name: str, spec: dict, base: Path, tmp: Path, log: IO[str] | 
     # buildx の builder は ~/.docker にあるので、DOCKER_CONFIG を変えるのは crane だけにする
     docker_config = Path(os.environ["NOODLES_DOCKER_CONFIG"]) / name
     try:
+        split_large_layers(layout, log)
         login(docker_config)
         run("crane", "push", str(layout), ref, log=log, env={"DOCKER_CONFIG": str(docker_config)})
     finally:
