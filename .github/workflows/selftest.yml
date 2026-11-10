@@ -1,0 +1,15 @@
+# build.yml を、このリポジトリの test/ のサンプルで実際に流して確かめる。イメージは registry.noodles.jp/the-noodles/workflows/ に入る
+name: selftest
+on:
+  push:
+    branches-ignore: [v1]
+    paths: [".github/workflows/**", "scripts/**", "test/**"]
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  python-bot:
+    uses: ./.github/workflows/build.yml
+    with:
+      path: test/python-bot
+      scripts-ref: ${{ github.sha }}

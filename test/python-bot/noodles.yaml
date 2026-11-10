@@ -1,0 +1,6 @@
+project: workflows-test
+name: 共通ビルドのテスト
+services:
+  bot: { port: 8888 }
+env:
+  PORT: { default: "8888" }

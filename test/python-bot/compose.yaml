@@ -1,0 +1,5 @@
+# build.yml のテスト用（.github/workflows/selftest.yml）。依存は実際のBotと同じ規模にしてある
+services:
+  bot:
+    build:
+      context: .

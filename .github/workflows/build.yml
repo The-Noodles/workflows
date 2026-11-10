@@ -9,6 +9,10 @@ on:
         description: リポジトリの中の置き場所（compose.yaml と noodles.yaml がある場所）
         type: string
         default: "."
+      scripts-ref:
+        description: scripts/ を取るこのリポジトリのref。このリポジトリのテスト（selftest.yml）だけが変える
+        type: string
+        default: v1
 
 jobs:
   build:
@@ -21,33 +25,48 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/checkout@v7
+      # scripts/ はビルドの対象に混ざらないよう、作業ディレクトリの外に置く。待ち時間を重ねるため、まとめて並べて流す
+      - name: 道具をそろえる
+        env:
+          SCRIPTS_REF: ${{ inputs.scripts-ref }}
+        run: |
+          set -euo pipefail
+          home="$RUNNER_TEMP/noodles"
+          mkdir -p "$home/bin" "$home/src"
+          cd "$home"
+          docker buildx create --name noodles --driver docker-container --use --bootstrap > buildx.log 2>&1 &
+          pids="$!"
+          curl -fsSL --retry 3 "https://codeload.github.com/The-Noodles/workflows/tar.gz/$SCRIPTS_REF" | tar -xz -C src --strip-components=1 &
+          pids="$pids $!"
+          curl -fsSL --retry 3 -o crane.tar.gz https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz &
+          pids="$pids $!"
+          curl -fsSL --retry 3 -o railpack.tar.gz https://github.com/railwayapp/railpack/releases/download/v0.43.0/railpack-v0.43.0-x86_64-unknown-linux-musl.tar.gz &
+          pids="$pids $!"
+          python3 -c 'import yaml' 2>/dev/null || pip install --user --break-system-packages --quiet pyyaml==6.0.3
+          for pid in $pids; do
+            wait "$pid" || { cat buildx.log; exit 1; }
+          done
+          sha256sum -c - <<'SUMS'
+          0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0  crane.tar.gz
+          248a8f60f36854aabed6124113631078a802de3461660855fc4de9c26065c1fb  railpack.tar.gz
+          SUMS
+          tar -xzf crane.tar.gz -C bin crane
+          tar -xzf railpack.tar.gz -C bin railpack
+          echo "$home/bin" >> "$GITHUB_PATH"
+      # buildx が Actions のキャッシュ（type=gha）を読み書きするためのトークンとURLは、アクションの中でしか見えない
+      - uses: actions/github-script@v9
         with:
-          repository: The-Noodles/workflows
-          ref: v1
-          path: .noodles-workflows
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-      - run: pip install pyyaml==6.0.3
+          script: |
+            for (const [key, value] of Object.entries(process.env)) {
+              if (key.startsWith('ACTIONS_') && value) core.exportVariable(key, value)
+            }
       - name: noodles.yaml と宣言漏れの確認
         env:
           APP_PATH: ${{ inputs.path }}
-        run: python3 .noodles-workflows/scripts/check.py "$APP_PATH"
-      - uses: docker/setup-buildx-action@v4
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-          cache: false
-      - name: crane と Railpack を入れる
-        run: |
-          go install github.com/google/go-containerregistry/cmd/crane@v0.22.1
-          go install github.com/railwayapp/railpack/cmd/cli@v0.43.0
-          mv "$(go env GOPATH)/bin/cli" "$(go env GOPATH)/bin/railpack"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+        run: python3 "$RUNNER_TEMP/noodles/src/scripts/check.py" "$APP_PATH"
       - name: ビルドして push する
         env:
           APP_PATH: ${{ inputs.path }}
           COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
-          NOODLES_DOCKER_CONFIG: ${{ runner.temp }}/noodles-docker
-        run: python3 .noodles-workflows/scripts/build.py
+          NOODLES_DOCKER_CONFIG: ${{ runner.temp }}/noodles/docker
+        run: python3 "$RUNNER_TEMP/noodles/src/scripts/build.py"
