@@ -10,6 +10,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -83,23 +84,104 @@ def login(config_dir: Path) -> None:
     path.chmod(0o600)
 
 
+def shortcut_plan(plan: dict) -> dict | None:
+    """コマンドのない手順（前の手順の上にソースを置くだけ）を飛ばした Railpack の計画を返す。飛ばせなければ None。
+
+    Python などでは build の手順が「install の結果の上にソースを置く」だけで、完成品はそこから依存とソースを取り出す。
+    このままだと、ソースが変わるたびに install の結果（ビルド用のイメージと依存、数百MB）を取り寄せて展開することになる。
+    完成品が、依存は install から、ソースは手元から直接取るようにすると、変わっていない層は取り寄せずに済む。
+    """
+    steps = {s.get("name"): s for s in plan.get("steps") or []}
+    excluded = set(plan.get("exclude") or [])
+    changed = False
+    inputs: list[dict] = []
+    for layer in (plan.get("deploy") or {}).get("inputs") or []:
+        step = steps.get(layer.get("step"))
+        if step is None or step.get("commands"):
+            inputs.append(layer)
+            continue
+        below = step.get("inputs") or []
+        if len(below) != 2 or set(below[0]) != {"step"} or below[1] != {"include": ["."], "local": True}:
+            return None
+        if any(i.get("step") == step["name"] for other in steps.values() for i in other.get("inputs") or []):
+            return None
+        include = layer.get("include") or []
+        rest = {k: v for k, v in layer.items() if k != "step"}
+        if include == ["."]:
+            inputs += [{**rest, "step": below[0]["step"]}, {**rest, "local": True}]
+        elif include and all(path.startswith("/") and not_from_source(path, excluded) for path in include):
+            inputs.append({**rest, "step": below[0]["step"]})
+        else:
+            return None
+        changed = True
+    if not changed:
+        return None
+    return {**plan, "deploy": {**plan["deploy"], "inputs": inputs}}
+
+
+def not_from_source(path: str, excluded: set[str]) -> bool:
+    """絶対パスが、手元のソースからは来ない場所（/app の外か、ソースから除かれるディレクトリの中）なら True。"""
+    if path != "/app" and not path.startswith("/app/"):
+        return True
+    parts = path.removeprefix("/app").strip("/").split("/")
+    return parts[0] in excluded
+
+
+def list_files(layout: Path) -> dict:
+    import tarfile
+    blob = lambda d: layout / "blobs" / d.replace(":", "/")
+    manifest = json.loads(blob(json.loads((layout / "index.json").read_text())["manifests"][0]["digest"]).read_text())
+    files: dict = {}
+    for layer in manifest["layers"]:
+        with tarfile.open(blob(layer["digest"])) as t:
+            for m in t:
+                files[m.name.rstrip("/")] = (m.type, oct(m.mode), m.uid, m.gid, m.size if m.isfile() else 0, m.linkname)
+    return files
+
+
 def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str], layout: Path, scope: str, log: IO[str] | None) -> list[str] | None:
     """ビルドして layout に書き出す。キャッシュが使えるときは、キャッシュへ書き出すためのコマンドを返す。"""
     common = ["docker", "buildx", "build", "--provenance=false", "--sbom=false"]
     for k, v in args.items():
         common += ["--build-arg", f"{k}={v}"]
+    fallback: list[str] | None = None
     if dockerfile is not None:
         common += ["-f", str(dockerfile), str(context)]
     else:
         plan = layout.parent / f"{name}-railpack-plan.json"
         run("railpack", "prepare", str(context), "--plan-out", str(plan), "--info-out", str(layout.parent / f"{name}-railpack-info.json"), log=log)
-        common += ["--build-arg", f"BUILDKIT_SYNTAX={RAILPACK_FRONTEND}", "-f", str(plan), str(context)]
+        railpack = ["--build-arg", f"BUILDKIT_SYNTAX={RAILPACK_FRONTEND}"]
+        short = shortcut_plan(json.loads(plan.read_text()))
+        if short is not None:
+            short_plan = layout.parent / f"{name}-railpack-plan-short.json"
+            short_plan.write_text(json.dumps(short))
+            fallback = [*common, *railpack, "-f", str(plan), str(context)]
+            common += [*railpack, "-f", str(short_plan), str(context)]
+        else:
+            common += [*railpack, "-f", str(plan), str(context)]
     output = ["--output", f"type=oci,tar=false,dest={layout}"]
     # キャッシュの読み書きには、build.yml が環境変数に出す Actions のトークンが要る
-    if not os.environ.get("ACTIONS_RUNTIME_TOKEN"):
-        run_build(*common, *output, log=log)
+    cached = bool(os.environ.get("ACTIONS_RUNTIME_TOKEN"))
+    read_cache = ["--cache-from", f"type=gha,scope={scope}"] if cached else []
+    try:
+        run_build(*common, *output, *read_cache, log=log)
+    except subprocess.CalledProcessError:
+        if fallback is None:
+            raise
+        print("::warning::手順を飛ばした計画でビルドできなかったので、Railpack の計画のままビルドし直します", file=log, flush=True)
+        shutil.rmtree(layout, ignore_errors=True)
+        common = fallback
+        run_build(*common, *output, *read_cache, log=log)
+    if fallback is not None and common is not fallback and os.environ.get("GITHUB_REPOSITORY") == "The-Noodles/workflows":
+        other = layout.parent / f"{name}-orig"
+        run_build(*fallback, "--output", f"type=oci,tar=false,dest={other}", log=log)
+        a, b = list_files(layout), list_files(other)
+        diff = sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
+        print(f"DEBUG 計画の比較：{len(a)} / {len(b)} ファイル、違い {len(diff)} 件", file=log)
+        for k in diff[:40]:
+            print("  ", k, a.get(k), b.get(k), file=log)
+    if not cached:
         return None
-    run_build(*common, *output, "--cache-from", f"type=gha,scope={scope}", log=log)
     return [*common, "--output", "type=cacheonly", "--cache-to", f"type=gha,scope={scope},mode=max,ignore-error=true"]
 
 
