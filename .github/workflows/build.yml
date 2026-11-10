@@ -35,19 +35,30 @@ jobs:
           APP_PATH: ${{ inputs.path }}
         run: python3 .noodles-workflows/scripts/check.py "$APP_PATH"
       - uses: docker/setup-buildx-action@v4
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-          cache: false
       - name: crane と Railpack を入れる
         run: |
-          go install github.com/google/go-containerregistry/cmd/crane@v0.22.1
-          go install github.com/railwayapp/railpack/cmd/cli@v0.43.0
-          mv "$(go env GOPATH)/bin/cli" "$(go env GOPATH)/bin/railpack"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          bin="$RUNNER_TEMP/noodles-bin"
+          mkdir -p "$bin"
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o crane.tar.gz https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz
+          curl -fsSL --retry 3 -o railpack.tar.gz https://github.com/railwayapp/railpack/releases/download/v0.43.0/railpack-v0.43.0-x86_64-unknown-linux-musl.tar.gz
+          sha256sum -c - <<'SUMS'
+          0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0  crane.tar.gz
+          248a8f60f36854aabed6124113631078a802de3461660855fc4de9c26065c1fb  railpack.tar.gz
+          SUMS
+          tar -xzf crane.tar.gz -C "$bin" crane
+          tar -xzf railpack.tar.gz -C "$bin" railpack
+          echo "$bin" >> "$GITHUB_PATH"
+      # 依存を入れる層などを次のビルドで使い回す。キーはコミットごとに変え、前のものから復元する
+      - uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/noodles-cache
+          key: noodles-build-${{ inputs.path }}-${{ github.sha }}
+          restore-keys: noodles-build-${{ inputs.path }}-
       - name: ビルドして push する
         env:
           APP_PATH: ${{ inputs.path }}
           COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
           NOODLES_DOCKER_CONFIG: ${{ runner.temp }}/noodles-docker
+          NOODLES_CACHE: ${{ runner.temp }}/noodles-cache
         run: python3 .noodles-workflows/scripts/build.py

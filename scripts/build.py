@@ -7,6 +7,7 @@
 import json
 import os
 import re
+import shutil
 import urllib.request
 import subprocess
 import sys
@@ -47,8 +48,12 @@ def login(config_dir: Path) -> None:
     path.chmod(0o600)
 
 
-def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str], out: Path) -> None:
+def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str], out: Path, cache: Path | None) -> None:
     common = ["docker", "buildx", "build", "--provenance=false", "--sbom=false", "--output", f"type=oci,dest={out}"]
+    if cache is not None:
+        if (cache / "index.json").exists():
+            common += ["--cache-from", f"type=local,src={cache}"]
+        common += ["--cache-to", f"type=local,dest={cache}.new,mode=max"]
     for k, v in args.items():
         common += ["--build-arg", f"{k}={v}"]
     if dockerfile is not None:
@@ -83,7 +88,12 @@ def main() -> int:
             if isinstance(raw_args, list):
                 raw_args = dict(str(a).split("=", 1) for a in raw_args if "=" in str(a))
             args = {str(k): str(v) for k, v in raw_args.items() if v is not None}
-            build(name, context, df if df.exists() else None, args, out)
+            cache = Path(os.environ["NOODLES_CACHE"]) / name if os.environ.get("NOODLES_CACHE") else None
+            build(name, context, df if df.exists() else None, args, out, cache)
+            if cache is not None:
+                # 前回のキャッシュを今回書き出したもので置き換える
+                shutil.rmtree(cache, ignore_errors=True)
+                Path(f"{cache}.new").rename(cache)
             layout = Path(tmp) / name
             with tarfile.open(out) as t:
                 t.extractall(layout, filter="data")
