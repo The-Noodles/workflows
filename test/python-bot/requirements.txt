@@ -1,0 +1,8 @@
+discord.py==2.5.2
+aiohttp==3.12.15
+asyncpg==0.31.0
+python-dotenv==1.1.1
+rblx-open-cloud==2.2.6
+Pillow==12.3.0
+typesafe-sdk==0.7.0
+audioop-lts==0.2.1; python_version >= "3.13"

@@ -2,18 +2,21 @@
 
 イメージの名前は registry.noodles.jp/<owner>/<repo>/<サービス>:<コミット>（すべて小文字）。
 置き場所がルートでなければ、サービス名の前に置き場所を付ける（Hub の modules/platform/server/compose.ts と同じ決まり）。
+
+ビルドの層は GitHub Actions のキャッシュ（type=gha）に置き、次のビルドで使い回す。変わらなかった層は中身が同じになるので、
+レジストリにすでにあるものとして push も飛ばされる。サービスが複数あるときは並べてビルドする。
 """
 
 import json
 import os
 import re
-import shutil
-import urllib.request
 import subprocess
 import sys
-import tarfile
 import tempfile
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import IO
 
 import yaml
 
@@ -22,17 +25,20 @@ REGISTRY = "registry.noodles.jp"
 RAILPACK_FRONTEND = "ghcr.io/railwayapp/railpack-frontend:v0.43.0"
 
 
-def run(*args: str, env: dict[str, str] | None = None) -> None:
-    print("+", " ".join(args), flush=True)
-    subprocess.run(args, check=True, env=None if env is None else {**os.environ, **env})
+def run(*args: str, log: IO[str] | None, env: dict[str, str] | None = None) -> None:
+    print("+", " ".join(args), file=log, flush=True)
+    subprocess.run(args, check=True, env=None if env is None else {**os.environ, **env}, stdout=log, stderr=subprocess.STDOUT if log else None)
+
+
+def image_segment(path: str, service: str) -> str:
+    if path in ("", "."):
+        return service
+    p = re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-")
+    return f"{p}-{service}"
 
 
 def image_name(repo: str, path: str, service: str, commit: str) -> str:
-    seg = service
-    if path not in ("", "."):
-        p = re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-")
-        seg = f"{p}-{service}"
-    return f"{REGISTRY}/{repo.lower()}/{seg}:{commit}"
+    return f"{REGISTRY}/{repo.lower()}/{image_segment(path, service)}:{commit}"
 
 
 def login(config_dir: Path) -> None:
@@ -48,60 +54,69 @@ def login(config_dir: Path) -> None:
     path.chmod(0o600)
 
 
-def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str], out: Path, cache: Path | None) -> None:
-    common = ["docker", "buildx", "build", "--provenance=false", "--sbom=false", "--output", f"type=oci,dest={out}"]
-    if cache is not None:
-        if (cache / "index.json").exists():
-            common += ["--cache-from", f"type=local,src={cache}"]
-        common += ["--cache-to", f"type=local,dest={cache}.new,mode=max"]
+def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str], layout: Path, scope: str, log: IO[str] | None) -> None:
+    common = ["docker", "buildx", "build", "--provenance=false", "--sbom=false", "--output", f"type=oci,tar=false,dest={layout}"]
+    # キャッシュの読み書きには、build.yml が環境変数に出す Actions のトークンが要る
+    if os.environ.get("ACTIONS_RUNTIME_TOKEN"):
+        common += ["--cache-from", f"type=gha,scope={scope}", "--cache-to", f"type=gha,scope={scope},mode=max,ignore-error=true"]
     for k, v in args.items():
         common += ["--build-arg", f"{k}={v}"]
     if dockerfile is not None:
-        run(*common, "-f", str(dockerfile), str(context))
+        run(*common, "-f", str(dockerfile), str(context), log=log)
         return
-    plan = out.parent / f"{name}-railpack-plan.json"
-    run("railpack", "prepare", str(context), "--plan-out", str(plan), "--info-out", str(out.parent / f"{name}-railpack-info.json"))
-    run(*common, "--build-arg", f"BUILDKIT_SYNTAX={RAILPACK_FRONTEND}", "-f", str(plan), str(context))
+    plan = layout.parent / f"{name}-railpack-plan.json"
+    run("railpack", "prepare", str(context), "--plan-out", str(plan), "--info-out", str(layout.parent / f"{name}-railpack-info.json"), log=log)
+    run(*common, "--build-arg", f"BUILDKIT_SYNTAX={RAILPACK_FRONTEND}", "-f", str(plan), str(context), log=log)
+
+
+def build_and_push(name: str, spec: dict, base: Path, tmp: Path, log: IO[str] | None) -> None:
+    app_path = str(os.environ.get("APP_PATH") or ".")
+    context = (base / spec.get("context", ".")).resolve()
+    df = context / (spec.get("dockerfile") or "Dockerfile")
+    raw_args = spec.get("args") or {}
+    if isinstance(raw_args, list):
+        raw_args = dict(str(a).split("=", 1) for a in raw_args if "=" in str(a))
+    args = {str(k): str(v) for k, v in raw_args.items() if v is not None}
+    layout = tmp / name
+    build(name, context, df if df.exists() else None, args, layout, f"noodles-{image_segment(app_path, name)}", log)
+    ref = image_name(os.environ["GITHUB_REPOSITORY"], app_path, name, os.environ["COMMIT"])
+    # buildx の builder は ~/.docker にあるので、DOCKER_CONFIG を変えるのは crane だけにする
+    docker_config = Path(os.environ["NOODLES_DOCKER_CONFIG"]) / name
+    login(docker_config)
+    run("crane", "push", str(layout), ref, log=log, env={"DOCKER_CONFIG": str(docker_config)})
 
 
 def main() -> int:
     base = Path(os.environ.get("APP_PATH") or ".")
-    repo = os.environ["GITHUB_REPOSITORY"]
-    commit = os.environ["COMMIT"]
     compose = yaml.safe_load((base / "compose.yaml").read_text()) or {}
-    services = compose.get("services") or {}
-    built = 0
-    # buildx の builder は ~/.docker にあるので、DOCKER_CONFIG を変えるのは crane だけにする
-    docker_config = Path(os.environ["NOODLES_DOCKER_CONFIG"])
+    targets: dict[str, dict] = {}
+    for name, svc in (compose.get("services") or {}).items():
+        spec = (svc or {}).get("build")
+        if spec is not None:
+            targets[name] = {"context": spec} if isinstance(spec, str) else spec
+    failed = False
     with tempfile.TemporaryDirectory() as tmp:
-        for name, svc in services.items():
-            spec = (svc or {}).get("build")
-            if spec is None:
-                continue
-            if isinstance(spec, str):
-                spec = {"context": spec}
-            context = (base / spec.get("context", ".")).resolve()
-            dockerfile = spec.get("dockerfile")
-            df = context / (dockerfile or "Dockerfile")
-            out = Path(tmp) / f"{name}.tar"
-            raw_args = spec.get("args") or {}
-            if isinstance(raw_args, list):
-                raw_args = dict(str(a).split("=", 1) for a in raw_args if "=" in str(a))
-            args = {str(k): str(v) for k, v in raw_args.items() if v is not None}
-            cache = Path(os.environ["NOODLES_CACHE"]) / name if os.environ.get("NOODLES_CACHE") else None
-            build(name, context, df if df.exists() else None, args, out, cache)
-            if cache is not None:
-                # 前回のキャッシュを今回書き出したもので置き換える
-                shutil.rmtree(cache, ignore_errors=True)
-                Path(f"{cache}.new").rename(cache)
-            layout = Path(tmp) / name
-            with tarfile.open(out) as t:
-                t.extractall(layout, filter="data")
-            ref = image_name(repo, str(os.environ.get("APP_PATH") or "."), name, commit)
-            login(docker_config)
-            run("crane", "push", str(layout), ref, env={"DOCKER_CONFIG": str(docker_config)})
-            built += 1
-    print(f"{built}個のイメージを push しました")
+        if len(targets) == 1:
+            for name, spec in targets.items():
+                build_and_push(name, spec, base, Path(tmp), None)
+        elif targets:
+            # 並べて流すと出力が混ざるので、サービスごとにファイルへ取っておき、終わった順ではなく名前の順にまとめて出す
+            logs = {name: open(Path(tmp) / f"{name}.log", "w+") for name in targets}
+            with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+                jobs = {name: pool.submit(build_and_push, name, spec, base, Path(tmp), logs[name]) for name, spec in targets.items()}
+            for name, job in jobs.items():
+                err = job.exception()
+                print(f"::group::{name}" + ("（失敗）" if err else ""), flush=True)
+                logs[name].seek(0)
+                sys.stdout.write(logs[name].read())
+                logs[name].close()
+                print("::endgroup::", flush=True)
+                if err:
+                    print(f"::error::{name} のビルドに失敗しました：{err}", flush=True)
+                    failed = True
+    if failed:
+        return 1
+    print(f"{len(targets)}個のイメージを push しました")
     return 0
 
 
