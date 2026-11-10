@@ -91,7 +91,7 @@ def login(config_dir: Path) -> str:
 # レジストリの前の Cloudflare は 100MB を超える要求を断る（413）。crane は層を1回の要求で送るので、
 # 大きい層だけ先に分けて送っておく（crane はレジストリにある層を飛ばす）
 LARGE_BLOB = 90 * 1024 * 1024
-BLOB_CHUNK = 64 * 1024 * 1024
+BLOB_CHUNK = 16 * 1024 * 1024
 
 
 # Cloudflare は Python-urllib の User-Agent を断るので、crane と同じものを名乗る
@@ -115,6 +115,25 @@ def registry_request(method: str, url: str, token: str, data: bytes | None = Non
         raise RuntimeError(f"{method} {url.split('?')[0]}: {e.code} server={server} cf-ray={ray} {e.read()[:300]!r}") from e
 
 
+def with_retry(call, log: IO[str] | None, what: str):
+    """5xx や接続の切断はレジストリの前段で時々起きるので、間を空けて数回やり直す。"""
+    for attempt in range(5):
+        try:
+            return call()
+        except (RuntimeError, OSError) as e:
+            if attempt == 4 or (isinstance(e, RuntimeError) and ": 5" not in str(e) and "timed out" not in str(e)):
+                raise
+            print(f"{what} をやり直します（{attempt + 1}回目）：{e}", file=log, flush=True)
+            time.sleep(3 * 2**attempt)
+
+
+def uploaded_offset(url: str, token: str) -> int:
+    """途中まで送った層の、レジストリが受け取り済みの大きさ。"""
+    res = registry_request("GET", url, token)
+    end = res.headers.get("Range", "0-0").rsplit("-", 1)[-1]
+    return int(end) + 1 if end and int(end) > 0 else 0
+
+
 def upload_large_blobs(layout: Path, ref: str, token: str, log: IO[str] | None) -> None:
     repo = ref.removeprefix(REGISTRY + "/").rsplit(":", 1)[0]
     base = f"https://{REGISTRY}/v2/{repo}/blobs/"
@@ -123,39 +142,41 @@ def upload_large_blobs(layout: Path, ref: str, token: str, log: IO[str] | None) 
         if size <= LARGE_BLOB:
             continue
         digest = "sha256:" + path.name
-        if registry_request("HEAD", base + digest, token) is not None:
+        if with_retry(lambda: registry_request("HEAD", base + digest, token), log, "層の確認") is not None:
             continue
+        started = time.monotonic()
         print(f"大きい層を分けて送ります：{digest}（{size // (1024 * 1024)}MB）", file=log, flush=True)
-        location = registry_request("POST", base + "uploads/", token, data=b"").headers["Location"]
+        url = urllib.parse.urljoin(
+            base, with_retry(lambda: registry_request("POST", base + "uploads/", token, data=b""), log, "送信の開始").headers["Location"]
+        )
         offset = 0
         with path.open("rb") as f:
-            while chunk := f.read(BLOB_CHUNK):
-                res = registry_request(
-                    "PATCH",
-                    urllib.parse.urljoin(base, location),
-                    token,
-                    data=chunk,
-                    headers={"Content-Type": "application/octet-stream", "Content-Range": f"{offset}-{offset + len(chunk) - 1}"},
-                )
-                location = res.headers["Location"]
-                offset += len(chunk)
-        url = urllib.parse.urljoin(base, location)
-        started = time.monotonic()
-        try:
-            registry_request("PUT", url + ("&" if "?" in url else "?") + "digest=" + urllib.parse.quote(digest), token, data=b"")
-        except RuntimeError as e:
-            # 仕上げ（R2 上での移動）の途中で前段が 5xx を返しても、レジストリ側では仕上がっていることがある
-            print(f"仕上げの応答がエラーでした（{time.monotonic() - started:.1f}秒）：{e}", file=log, flush=True)
-            for _ in range(20):
-                time.sleep(6)
+            while offset < size:
+                f.seek(offset)
+                chunk = f.read(BLOB_CHUNK)
                 try:
-                    if registry_request("HEAD", base + digest, token) is not None:
-                        break
-                except RuntimeError:
-                    pass
-            else:
+                    res = registry_request(
+                        "PATCH",
+                        url,
+                        token,
+                        data=chunk,
+                        headers={"Content-Type": "application/octet-stream", "Content-Range": f"{offset}-{offset + len(chunk) - 1}"},
+                    )
+                except (RuntimeError, OSError) as e:
+                    print(f"{offset // (1024 * 1024)}MB から先の送信に失敗したので、受け取り済みの位置から続けます：{e}", file=log, flush=True)
+                    time.sleep(5)
+                    offset = with_retry(lambda: uploaded_offset(url, token), log, "送信の位置の確認")
+                    continue
+                url = urllib.parse.urljoin(base, res.headers["Location"])
+                offset += len(chunk)
+        put = url + ("&" if "?" in url else "?") + "digest=" + urllib.parse.quote(digest)
+        try:
+            with_retry(lambda: registry_request("PUT", put, token, data=b""), log, "仕上げ")
+        except (RuntimeError, OSError):
+            # 仕上げの応答がエラーでも、レジストリ側では仕上がっていることがある
+            if with_retry(lambda: registry_request("HEAD", base + digest, token), log, "層の確認") is None:
                 raise
-        print(f"送り終えました：{digest}（仕上げ {time.monotonic() - started:.1f}秒）", file=log, flush=True)
+        print(f"送り終えました：{digest}（{time.monotonic() - started:.1f}秒）", file=log, flush=True)
 
 
 def shortcut_plan(plan: dict) -> dict | None:
