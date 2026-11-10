@@ -105,15 +105,22 @@ def split_layer(layout: Path, blob: Path, work: Path) -> list[tuple[dict, str]]:
     """tar の並びを保ったまま PART_SIZE ごとの tar に分け、gzip した層の (記述子, diff_id) を返す。
     ハードリンクは同じ層の中のファイルにしか張れないので、元と別の層に入ったリンクは中身を写したファイルにする。"""
     assign: dict[str, int] = {}
+    sizes: dict[str, int] = {}
     crossing: set[str] = set()
     part, used = 0, 0
     with tarfile.open(blob, "r|*") as src:
         for member in src:
-            if used > 0 and used + member.size + 512 > PART_SIZE:
+            # 別の層に入るリンクは中身ごと写すので、元のファイルの大きさで数える
+            cross = member.islnk() and assign.get(member.linkname, part) != part
+            size = sizes.get(member.linkname, 0) if cross else member.size
+            if used > 0 and used + size + 512 > PART_SIZE:
                 part, used = part + 1, 0
+                if member.islnk() and not cross:
+                    cross, size = True, sizes.get(member.linkname, 0)
             assign[member.name] = part
-            used += member.size + 512
-            if member.islnk() and assign.get(member.linkname, part) != part:
+            sizes[member.name] = member.size
+            used += size + 512
+            if cross:
                 crossing.add(member.linkname)
 
     parts = [work / f"{blob.name}.{i}.tar" for i in range(part + 1)]
