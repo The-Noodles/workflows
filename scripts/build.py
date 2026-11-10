@@ -7,6 +7,7 @@
 レジストリにすでにあるものとして push も飛ばされる。キャッシュへの書き出しは push と並べて流す。サービスが複数あるときは並べてビルドする。
 """
 
+import contextlib
 import gzip
 import hashlib
 import json
@@ -117,16 +118,13 @@ def split_layer(layout: Path, blob: Path, work: Path) -> list[tuple[dict, str]]:
 
     parts = [work / f"{blob.name}.{i}.tar" for i in range(part + 1)]
     saved: dict[str, tuple[tarfile.TarInfo, Path]] = {}
-    out: tarfile.TarFile | None = None
-    current = -1
-    with tarfile.open(blob, "r|*") as src:
+    outs: dict[int, tarfile.TarFile] = {}
+    with contextlib.ExitStack() as stack, tarfile.open(blob, "r|*") as src:
         for member in src:
-            if assign[member.name] != current:
-                if out is not None:
-                    out.close()
-                current = assign[member.name]
-                out = tarfile.open(parts[current], "w", format=tarfile.PAX_FORMAT)
-            assert out is not None
+            current = assign[member.name]
+            if current not in outs:
+                outs[current] = stack.enter_context(tarfile.open(parts[current], "w", format=tarfile.PAX_FORMAT))
+            out = outs[current]
             if member.isreg() and member.name in crossing:
                 copy = work / f"link{len(saved)}"
                 with src.extractfile(member) as data, copy.open("wb") as f:  # type: ignore[union-attr]
@@ -144,8 +142,6 @@ def split_layer(layout: Path, blob: Path, work: Path) -> list[tuple[dict, str]]:
                     out.addfile(info, f)
                 continue
             out.addfile(member, src.extractfile(member) if member.isreg() else None)
-    if out is not None:
-        out.close()
 
     def compress(part: Path) -> tuple[dict, str]:
         raw = part.read_bytes()
