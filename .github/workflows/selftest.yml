@@ -13,8 +13,3 @@ jobs:
     with:
       path: test/python-bot
       scripts-ref: ${{ github.sha }}
-  # 比べるための、いまの v1
-  baseline:
-    uses: The-Noodles/workflows/.github/workflows/build.yml@v1
-    with:
-      path: test/python-bot

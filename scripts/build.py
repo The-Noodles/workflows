@@ -4,7 +4,7 @@
 置き場所がルートでなければ、サービス名の前に置き場所を付ける（Hub の modules/platform/server/compose.ts と同じ決まり）。
 
 ビルドの層は GitHub Actions のキャッシュ（type=gha）に置き、次のビルドで使い回す。変わらなかった層は中身が同じになるので、
-レジストリにすでにあるものとして push も飛ばされる。サービスが複数あるときは並べてビルドする。
+レジストリにすでにあるものとして push も飛ばされる。キャッシュへの書き出しは push と並べて流す。サービスが複数あるときは並べてビルドする。
 """
 
 import json
@@ -54,19 +54,24 @@ def login(config_dir: Path) -> None:
     path.chmod(0o600)
 
 
-def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str], layout: Path, scope: str, log: IO[str] | None) -> None:
-    common = ["docker", "buildx", "build", "--provenance=false", "--sbom=false", "--output", f"type=oci,tar=false,dest={layout}"]
-    # キャッシュの読み書きには、build.yml が環境変数に出す Actions のトークンが要る
-    if os.environ.get("ACTIONS_RUNTIME_TOKEN"):
-        common += ["--cache-from", f"type=gha,scope={scope}", "--cache-to", f"type=gha,scope={scope},mode=max,ignore-error=true"]
+def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str], layout: Path, scope: str, log: IO[str] | None) -> list[str] | None:
+    """ビルドして layout に書き出す。キャッシュが使えるときは、キャッシュへ書き出すためのコマンドを返す。"""
+    common = ["docker", "buildx", "build", "--provenance=false", "--sbom=false"]
     for k, v in args.items():
         common += ["--build-arg", f"{k}={v}"]
     if dockerfile is not None:
-        run(*common, "-f", str(dockerfile), str(context), log=log)
-        return
-    plan = layout.parent / f"{name}-railpack-plan.json"
-    run("railpack", "prepare", str(context), "--plan-out", str(plan), "--info-out", str(layout.parent / f"{name}-railpack-info.json"), log=log)
-    run(*common, "--build-arg", f"BUILDKIT_SYNTAX={RAILPACK_FRONTEND}", "-f", str(plan), str(context), log=log)
+        common += ["-f", str(dockerfile), str(context)]
+    else:
+        plan = layout.parent / f"{name}-railpack-plan.json"
+        run("railpack", "prepare", str(context), "--plan-out", str(plan), "--info-out", str(layout.parent / f"{name}-railpack-info.json"), log=log)
+        common += ["--build-arg", f"BUILDKIT_SYNTAX={RAILPACK_FRONTEND}", "-f", str(plan), str(context)]
+    output = ["--output", f"type=oci,tar=false,dest={layout}"]
+    # キャッシュの読み書きには、build.yml が環境変数に出す Actions のトークンが要る
+    if not os.environ.get("ACTIONS_RUNTIME_TOKEN"):
+        run(*common, *output, log=log)
+        return None
+    run(*common, *output, "--cache-from", f"type=gha,scope={scope}", log=log)
+    return [*common, "--output", "type=cacheonly", "--cache-to", f"type=gha,scope={scope},mode=max,ignore-error=true"]
 
 
 def build_and_push(name: str, spec: dict, base: Path, tmp: Path, log: IO[str] | None) -> None:
@@ -78,12 +83,27 @@ def build_and_push(name: str, spec: dict, base: Path, tmp: Path, log: IO[str] | 
         raw_args = dict(str(a).split("=", 1) for a in raw_args if "=" in str(a))
     args = {str(k): str(v) for k, v in raw_args.items() if v is not None}
     layout = tmp / name
-    build(name, context, df if df.exists() else None, args, layout, f"noodles-{image_segment(app_path, name)}", log)
+    save_cache = build(name, context, df if df.exists() else None, args, layout, f"noodles-{image_segment(app_path, name)}", log)
+    # キャッシュへの書き出しは時間がかかることがあるので、push と並べて流す。同じビルドをもう一度流すが、層はbuilderに残っているので作り直さない
+    cache_log = open(tmp / f"{name}-cache.log", "w+")
+    saving = subprocess.Popen(save_cache, stdout=cache_log, stderr=subprocess.STDOUT) if save_cache else None
     ref = image_name(os.environ["GITHUB_REPOSITORY"], app_path, name, os.environ["COMMIT"])
     # buildx の builder は ~/.docker にあるので、DOCKER_CONFIG を変えるのは crane だけにする
     docker_config = Path(os.environ["NOODLES_DOCKER_CONFIG"]) / name
-    login(docker_config)
-    run("crane", "push", str(layout), ref, log=log, env={"DOCKER_CONFIG": str(docker_config)})
+    try:
+        login(docker_config)
+        run("crane", "push", str(layout), ref, log=log, env={"DOCKER_CONFIG": str(docker_config)})
+    finally:
+        if saving is not None:
+            code = saving.wait()
+            cache_log.seek(0)
+            print("::group::キャッシュへの書き出し" if log is None else "キャッシュへの書き出し：", file=log, flush=True)
+            print(cache_log.read(), file=log, flush=True)
+            if log is None:
+                print("::endgroup::", flush=True)
+            if code != 0:
+                print("::warning::ビルドのキャッシュを書き出せませんでした（次のビルドが遅くなるだけで、今回のイメージには影響しません）", file=log, flush=True)
+        cache_log.close()
 
 
 def main() -> int:
