@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -139,7 +140,22 @@ def upload_large_blobs(layout: Path, ref: str, token: str, log: IO[str] | None) 
                 location = res.headers["Location"]
                 offset += len(chunk)
         url = urllib.parse.urljoin(base, location)
-        registry_request("PUT", url + ("&" if "?" in url else "?") + "digest=" + urllib.parse.quote(digest), token, data=b"")
+        started = time.monotonic()
+        try:
+            registry_request("PUT", url + ("&" if "?" in url else "?") + "digest=" + urllib.parse.quote(digest), token, data=b"")
+        except RuntimeError as e:
+            # 仕上げ（R2 上での移動）の途中で前段が 5xx を返しても、レジストリ側では仕上がっていることがある
+            print(f"仕上げの応答がエラーでした（{time.monotonic() - started:.1f}秒）：{e}", file=log, flush=True)
+            for _ in range(20):
+                time.sleep(6)
+                try:
+                    if registry_request("HEAD", base + digest, token) is not None:
+                        break
+                except RuntimeError:
+                    pass
+            else:
+                raise
+        print(f"送り終えました：{digest}（仕上げ {time.monotonic() - started:.1f}秒）", file=log, flush=True)
 
 
 def shortcut_plan(plan: dict) -> dict | None:
