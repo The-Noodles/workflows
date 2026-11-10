@@ -7,16 +7,16 @@
 レジストリにすでにあるものとして push も飛ばされる。キャッシュへの書き出しは push と並べて流す。サービスが複数あるときは並べてビルドする。
 """
 
+import gzip
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
-import time
-import urllib.error
-import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -74,8 +74,8 @@ def image_name(repo: str, path: str, service: str, commit: str) -> str:
     return f"{REGISTRY}/{repo.lower()}/{image_segment(path, service)}:{commit}"
 
 
-def login(config_dir: Path) -> str:
-    """GitHub ActionsのOIDCトークンを取り、crane が使う Docker の設定に置いて返す。トークンは数分で切れるので push の直前に呼ぶ。"""
+def login(config_dir: Path) -> None:
+    """GitHub ActionsのOIDCトークンを取り、crane が使う Docker の設定に置く。トークンは数分で切れるので push の直前に呼ぶ。"""
     url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=" + REGISTRY
     req = urllib.request.Request(url, headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
     with urllib.request.urlopen(req, timeout=30) as res:
@@ -85,99 +85,131 @@ def login(config_dir: Path) -> str:
     path = config_dir / "config.json"
     path.write_text(json.dumps({"auths": {REGISTRY: {"registrytoken": token}}}))
     path.chmod(0o600)
-    return token
+
 
 
 # レジストリの前の Cloudflare は 100MB を超える要求を断る（413）。crane は層を1回の要求で送るので、
-# 大きい層だけ先に分けて送っておく（crane はレジストリにある層を飛ばす）
-LARGE_BLOB = 90 * 1024 * 1024
-BLOB_CHUNK = 16 * 1024 * 1024
+# 大きい層は push の前に、中のファイルを順に分けて複数の層にする（重ねた結果は同じ）
+LARGE_LAYER = 90 * 1024 * 1024
+PART_SIZE = 64 * 1024 * 1024
 
 
-# Cloudflare は Python-urllib の User-Agent を断るので、crane と同じものを名乗る
-USER_AGENT = "go-containerregistry/v0.22.1"
+def write_blob(layout: Path, data: bytes) -> dict:
+    digest = hashlib.sha256(data).hexdigest()
+    (layout / "blobs" / "sha256" / digest).write_bytes(data)
+    return {"digest": "sha256:" + digest, "size": len(data)}
 
 
-def registry_request(method: str, url: str, token: str, data: bytes | None = None, headers: dict[str, str] | None = None):
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"Authorization": "Bearer " + token, "User-Agent": USER_AGENT, **(headers or {})},
-    )
-    try:
-        return urllib.request.urlopen(req, timeout=300)
-    except urllib.error.HTTPError as e:
-        if method == "HEAD" and e.code == 404:
-            return None
-        server = e.headers.get("server", "")
-        ray = e.headers.get("cf-ray", "")
-        raise RuntimeError(f"{method} {url.split('?')[0]}: {e.code} server={server} cf-ray={ray} {e.read()[:300]!r}") from e
+def split_layer(layout: Path, blob: Path, work: Path) -> list[tuple[dict, str]]:
+    """tar の並びを保ったまま PART_SIZE ごとの tar に分け、gzip した層の (記述子, diff_id) を返す。
+    ハードリンクは同じ層の中のファイルにしか張れないので、元と別の層に入ったリンクは中身を写したファイルにする。"""
+    assign: dict[str, int] = {}
+    crossing: set[str] = set()
+    part, used = 0, 0
+    with tarfile.open(blob, "r|*") as src:
+        for member in src:
+            if used > 0 and used + member.size + 512 > PART_SIZE:
+                part, used = part + 1, 0
+            assign[member.name] = part
+            used += member.size + 512
+            if member.islnk() and assign.get(member.linkname, part) != part:
+                crossing.add(member.linkname)
+
+    parts = [work / f"{blob.name}.{i}.tar" for i in range(part + 1)]
+    saved: dict[str, tuple[tarfile.TarInfo, Path]] = {}
+    out: tarfile.TarFile | None = None
+    current = -1
+    with tarfile.open(blob, "r|*") as src:
+        for member in src:
+            if assign[member.name] != current:
+                if out is not None:
+                    out.close()
+                current = assign[member.name]
+                out = tarfile.open(parts[current], "w", format=tarfile.PAX_FORMAT)
+            assert out is not None
+            if member.isreg() and member.name in crossing:
+                copy = work / f"link{len(saved)}"
+                with src.extractfile(member) as data, copy.open("wb") as f:  # type: ignore[union-attr]
+                    shutil.copyfileobj(data, f)
+                saved[member.name] = (member, copy)
+                with copy.open("rb") as f:
+                    out.addfile(member, f)
+                continue
+            if member.islnk() and member.linkname in saved and assign[member.linkname] != current:
+                target, copy = saved[member.linkname]
+                info = tarfile.TarInfo(member.name)
+                for key in ("mode", "uid", "gid", "uname", "gname", "mtime", "size", "pax_headers"):
+                    setattr(info, key, getattr(target, key))
+                with copy.open("rb") as f:
+                    out.addfile(info, f)
+                continue
+            out.addfile(member, src.extractfile(member) if member.isreg() else None)
+    if out is not None:
+        out.close()
+
+    def compress(part: Path) -> tuple[dict, str]:
+        raw = part.read_bytes()
+        part.unlink()
+        diff_id = "sha256:" + hashlib.sha256(raw).hexdigest()
+        desc = write_blob(layout, gzip.compress(raw, compresslevel=6, mtime=0))
+        return {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", **desc}, diff_id
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 2) as pool:
+        return list(pool.map(compress, parts))
 
 
-def with_retry(call, log: IO[str] | None, what: str):
-    """5xx や接続の切断はレジストリの前段で時々起きるので、間を空けて数回やり直す。"""
-    for attempt in range(5):
-        try:
-            return call()
-        except (RuntimeError, OSError) as e:
-            if attempt == 4 or (isinstance(e, RuntimeError) and ": 5" not in str(e) and "timed out" not in str(e)):
-                raise
-            print(f"{what} をやり直します（{attempt + 1}回目）：{e}", file=log, flush=True)
-            time.sleep(3 * 2**attempt)
+def split_manifest(layout: Path, entry: dict, log: IO[str] | None) -> None:
+    """entry が指すマニフェスト（入れ子の index も含む）の大きい層を分け、entry を新しいマニフェストに向ける。"""
+    blobs = layout / "blobs" / "sha256"
+    blob = blobs / entry["digest"].split(":", 1)[1]
+    if not blob.exists():
+        return
+    manifest = json.loads(blob.read_bytes())
+    if "manifests" in manifest:
+        before = json.dumps(manifest["manifests"])
+        for child in manifest["manifests"]:
+            split_manifest(layout, child, log)
+        if json.dumps(manifest["manifests"]) != before:
+            entry.update(write_blob(layout, json.dumps(manifest, separators=(",", ":")).encode()))
+        return
+    if not any(layer["size"] > LARGE_LAYER for layer in manifest.get("layers") or []):
+        return
+    config = json.loads((blobs / manifest["config"]["digest"].split(":", 1)[1]).read_bytes())
+    diff_ids = config["rootfs"]["diff_ids"]
+    history = config.get("history") or []
+    layered = [i for i, h in enumerate(history) if not h.get("empty_layer")]
+    if len(layered) != len(manifest["layers"]):
+        layered = []
+    layers: list[dict] = []
+    new_diff_ids: list[str] = []
+    new_history: list = list(history)
+    with tempfile.TemporaryDirectory(dir=layout) as work:
+        for i, layer in enumerate(manifest["layers"]):
+            if layer["size"] <= LARGE_LAYER or not layer["mediaType"].endswith(("tar", "tar+gzip", "tar.gzip")):
+                layers.append(layer)
+                new_diff_ids.append(diff_ids[i])
+                continue
+            parts = split_layer(layout, blobs / layer["digest"].split(":", 1)[1], Path(work))
+            sizes = "、".join(f"{d['size'] // (1024 * 1024)}MB" for d, _ in parts)
+            print(f"{layer['size'] // (1024 * 1024)}MB の層を {len(parts)} 個に分けました（{sizes}）", file=log, flush=True)
+            layers += [d for d, _ in parts]
+            new_diff_ids += [d for _, d in parts]
+            if layered:
+                new_history[layered[i]] = [history[layered[i]]] * len(parts)
+    config["rootfs"]["diff_ids"] = new_diff_ids
+    if layered:
+        config["history"] = [x for h in new_history for x in (h if isinstance(h, list) else [h])]
+    manifest["config"] = {**manifest["config"], **write_blob(layout, json.dumps(config, separators=(",", ":")).encode())}
+    manifest["layers"] = layers
+    entry.update(write_blob(layout, json.dumps(manifest, separators=(",", ":")).encode()))
 
 
-def uploaded_offset(url: str, token: str) -> int:
-    """途中まで送った層の、レジストリが受け取り済みの大きさ。"""
-    res = registry_request("GET", url, token)
-    end = res.headers.get("Range", "0-0").rsplit("-", 1)[-1]
-    return int(end) + 1 if end and int(end) > 0 else 0
-
-
-def upload_large_blobs(layout: Path, ref: str, token: str, log: IO[str] | None) -> None:
-    repo = ref.removeprefix(REGISTRY + "/").rsplit(":", 1)[0]
-    base = f"https://{REGISTRY}/v2/{repo}/blobs/"
-    for path in sorted((layout / "blobs" / "sha256").iterdir()):
-        size = path.stat().st_size
-        if size <= LARGE_BLOB:
-            continue
-        digest = "sha256:" + path.name
-        if with_retry(lambda: registry_request("HEAD", base + digest, token), log, "層の確認") is not None:
-            continue
-        started = time.monotonic()
-        print(f"大きい層を分けて送ります：{digest}（{size // (1024 * 1024)}MB）", file=log, flush=True)
-        url = urllib.parse.urljoin(
-            base, with_retry(lambda: registry_request("POST", base + "uploads/", token, data=b""), log, "送信の開始").headers["Location"]
-        )
-        offset = 0
-        with path.open("rb") as f:
-            while offset < size:
-                f.seek(offset)
-                chunk = f.read(BLOB_CHUNK)
-                try:
-                    res = registry_request(
-                        "PATCH",
-                        url,
-                        token,
-                        data=chunk,
-                        headers={"Content-Type": "application/octet-stream", "Content-Range": f"{offset}-{offset + len(chunk) - 1}"},
-                    )
-                except (RuntimeError, OSError) as e:
-                    print(f"{offset // (1024 * 1024)}MB から先の送信に失敗したので、受け取り済みの位置から続けます：{e}", file=log, flush=True)
-                    time.sleep(5)
-                    offset = with_retry(lambda: uploaded_offset(url, token), log, "送信の位置の確認")
-                    continue
-                url = urllib.parse.urljoin(base, res.headers["Location"])
-                offset += len(chunk)
-        put = url + ("&" if "?" in url else "?") + "digest=" + urllib.parse.quote(digest)
-        try:
-            with_retry(lambda: registry_request("PUT", put, token, data=b""), log, "仕上げ")
-        except (RuntimeError, OSError):
-            # 仕上げの応答がエラーでも、レジストリ側では仕上がっていることがある
-            if with_retry(lambda: registry_request("HEAD", base + digest, token), log, "層の確認") is None:
-                raise
-        print(f"送り終えました：{digest}（{time.monotonic() - started:.1f}秒）", file=log, flush=True)
-
+def split_large_layers(layout: Path, log: IO[str] | None) -> None:
+    index_path = layout / "index.json"
+    index = json.loads(index_path.read_text())
+    for entry in index["manifests"]:
+        split_manifest(layout, entry, log)
+    index_path.write_text(json.dumps(index, separators=(",", ":")))
 
 def shortcut_plan(plan: dict) -> dict | None:
     """コマンドのない手順（前の手順の上にソースを置くだけ）を飛ばした Railpack の計画を返す。飛ばせなければ None。
@@ -277,7 +309,8 @@ def build_and_push(name: str, spec: dict, base: Path, tmp: Path, log: IO[str] | 
     # buildx の builder は ~/.docker にあるので、DOCKER_CONFIG を変えるのは crane だけにする
     docker_config = Path(os.environ["NOODLES_DOCKER_CONFIG"]) / name
     try:
-        upload_large_blobs(layout, ref, login(docker_config), log)
+        split_large_layers(layout, log)
+        login(docker_config)
         run("crane", "push", str(layout), ref, log=log, env={"DOCKER_CONFIG": str(docker_config)})
     finally:
         if saving is not None:
