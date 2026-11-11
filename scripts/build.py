@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -295,6 +296,25 @@ def build(name: str, context: Path, dockerfile: Path | None, args: dict[str, str
     return [*common, "--output", "type=cacheonly", "--cache-to", f"type=gha,scope={scope},mode=max,ignore-error=true"]
 
 
+# レジストリは混んでいると一時的に5xxを返す。crane はレジストリにある層を送り直さないので、push ごとやり直す
+PUSH_ATTEMPTS = 3
+PUSH_RETRY_WAIT = 30
+
+
+def push(name: str, layout: Path, ref: str, docker_config: Path, log: IO[str] | None) -> None:
+    for attempt in range(1, PUSH_ATTEMPTS + 1):
+        login(docker_config)
+        try:
+            run("crane", "push", str(layout), ref, log=log, env={"DOCKER_CONFIG": str(docker_config)})
+            return
+        except subprocess.CalledProcessError:
+            if attempt == PUSH_ATTEMPTS:
+                raise
+            wait = PUSH_RETRY_WAIT * attempt
+            print(f"::warning::{name} の push に失敗したので、{wait}秒待ってやり直します（{attempt}/{PUSH_ATTEMPTS}回目）", file=log or sys.stdout, flush=True)
+            time.sleep(wait)
+
+
 def build_and_push(name: str, spec: dict, base: Path, tmp: Path, log: IO[str] | None) -> None:
     app_path = str(os.environ.get("APP_PATH") or ".")
     context = (base / spec.get("context", ".")).resolve()
@@ -313,8 +333,7 @@ def build_and_push(name: str, spec: dict, base: Path, tmp: Path, log: IO[str] | 
     docker_config = Path(os.environ["NOODLES_DOCKER_CONFIG"]) / name
     try:
         split_large_layers(layout, log)
-        login(docker_config)
-        run("crane", "push", str(layout), ref, log=log, env={"DOCKER_CONFIG": str(docker_config)})
+        push(name, layout, ref, docker_config, log)
     finally:
         if saving is not None:
             code = saving.wait()
